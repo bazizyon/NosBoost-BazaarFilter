@@ -10,13 +10,17 @@
 #include "TEWCustomPanelWidget.h"
 #include "TEWGraphicButtonWidget.h"
 #include "TNTConsignmentWidget.h"
+#include "TNTIconWidget.h"
 #include "RCBListPacket.h"
+#include "CardFilter.h"
+#include "ItemIcons.h"
 #include "ShellAttributes.h"
 #include "ShellFilter.h"
 
 #include <algorithm>
 #include <cwchar>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -30,10 +34,13 @@ namespace {
         {TEWEditWidget::ClassName, TEWEditWidget::Version, TEWEditWidget::ExpectedSize},
         {TEWLabel::ClassName, TEWLabel::Version, TEWLabel::ExpectedSize},
         {TNTConsignmentWidget::ClassName, TNTConsignmentWidget::Version, TNTConsignmentWidget::ExpectedSize},
+        {TNTIconWidget::ClassName, TNTIconWidget::Version, TNTIconWidget::ExpectedSize},
     };
 
     constexpr uint16_t CategoryWeapon = 2;
     constexpr uint16_t CategoryArmour = 3;
+    constexpr uint16_t CategorySpecialist = 6;
+    constexpr uint16_t CategoryPartner = 8;
 
     constexpr uint16_t PanelWidth = 270;
     constexpr int16_t Pad = 14;
@@ -48,6 +55,7 @@ namespace {
     constexpr int16_t ContentWidth = PanelWidth - 2 * Pad;
     constexpr int16_t RemoveX = PanelWidth - Pad - RemoveSize;
     constexpr int16_t ValueX = RemoveX - 6 - ValueBoxWidth;
+    constexpr int16_t CardValueX = PanelWidth - Pad - ValueBoxWidth;
     constexpr int MaxGroups = 4;
     constexpr int MaxStatsPerGroup = 6;
     constexpr int ResultsPerPage = 10;
@@ -108,7 +116,54 @@ namespace {
     };
 
     CategoryPanel Panels[3];
+
+    struct SpecialistPanel {
+        CardFilter::SpFilter Rules;
+        TLBSWidget* Container = nullptr;
+        WidgetKit::EditBox Min[CardFilter::SpStatCount]{};
+    } Specialists;
+
+    struct PartnerPanel {
+        TLBSWidget* Container = nullptr;
+    } Partners;
+
+    enum class View : uint8_t {
+        None,
+        Weapon,
+        Armour,
+        Specialist,
+        Partner,
+    };
+    View ShownView = View::None;
+
+    struct SpRowInfo {
+        TLBSWidget* Group = nullptr;
+        TEWLabel* Perf[4] = {};
+        TEWLabel* PvE = nullptr;
+        TEWLabel* PvP = nullptr;
+        TEWLabel* Upgrade = nullptr;
+    };
+
+    struct PspRowInfo {
+        TNTIconWidget* Badge = nullptr;
+        TLBSWidget* Group = nullptr;
+        TEWLabel* Ranks[3] = {};
+        TEWLabel* Upgrade = nullptr;
+    };
+
+    SpRowInfo SpRows[ResultsPerPage];
+    PspRowInfo PspRows[ResultsPerPage];
+    uint32_t ListingsVersion = 1;
+    uint32_t RenderedVersion[ResultsPerPage] = {};
+    int RenderedIndex[ResultsPerPage] = {};
+    bool NameColumnHiddenByUs = false;
+    bool AmountColumnHiddenByUs = false;
+    bool WasLoading = false;
+    int16_t OriginalIcon[ResultsPerPage] = {};
+    bool IconReplacedByUs[ResultsPerPage] = {};
+
     TEWCustomPanelWidget* Window = nullptr;
+    TEWLabel* TitleLabel = nullptr;
     TLBSWidget* Unavailable = nullptr;
     Color Tint = FallbackTint;
 
@@ -123,7 +178,9 @@ namespace {
         bool TintMatches = true;
         bool DimOthers = true;
         bool HideOtherBuys = false;
-        bool Enabled = true;
+        bool Enabled = false;
+        bool SpShowInfo = true;
+        bool PspShowRanks = true;
     } Config;
 
     bool BuyHiddenByUs[ResultsPerPage] = {};
@@ -140,7 +197,8 @@ namespace {
         Config.TintMatches = GetPrivateProfileIntA("BazaarFilter", "TintMatches", 1, Path.c_str()) != 0;
         Config.DimOthers = GetPrivateProfileIntA("BazaarFilter", "DimOthers", 1, Path.c_str()) != 0;
         Config.HideOtherBuys = GetPrivateProfileIntA("BazaarFilter", "HideOtherBuys", 0, Path.c_str()) != 0;
-        Config.Enabled = GetPrivateProfileIntA("BazaarFilter", "Enabled", 1, Path.c_str()) != 0;
+        Config.SpShowInfo = GetPrivateProfileIntA("BazaarFilter", "SpShowInfo", 1, Path.c_str()) != 0;
+        Config.PspShowRanks = GetPrivateProfileIntA("BazaarFilter", "PspShowRanks", 1, Path.c_str()) != 0;
     }
 
     void __cdecl SaveSettings(void*) {
@@ -148,7 +206,8 @@ namespace {
         WritePrivateProfileStringA("BazaarFilter", "TintMatches", Config.TintMatches ? "1" : "0", Path.c_str());
         WritePrivateProfileStringA("BazaarFilter", "DimOthers", Config.DimOthers ? "1" : "0", Path.c_str());
         WritePrivateProfileStringA("BazaarFilter", "HideOtherBuys", Config.HideOtherBuys ? "1" : "0", Path.c_str());
-        WritePrivateProfileStringA("BazaarFilter", "Enabled", Config.Enabled ? "1" : "0", Path.c_str());
+        WritePrivateProfileStringA("BazaarFilter", "SpShowInfo", Config.SpShowInfo ? "1" : "0", Path.c_str());
+        WritePrivateProfileStringA("BazaarFilter", "PspShowRanks", Config.PspShowRanks ? "1" : "0", Path.c_str());
     }
 
     void Attach(TLBSWidget* Parent, TLBSWidget* Child) {
@@ -472,12 +531,66 @@ namespace {
         Rebind(Panel);
     }
 
+    TLBSWidget* CreateCardContainer() {
+        TLBSWidget* Container = Widget::Create<TLBSWidget>(CachedHost);
+        if (!Container) return nullptr;
+        Container->isVisible = false;
+        Attach(Window, Container);
+        return Container;
+    }
+
+    void CreateSpecialistPanel() {
+        TLBSWidget* Parent = Specialists.Container = CreateCardContainer();
+        if (!Parent) return;
+        Attach(Parent, WidgetKit::CreateLabeledCheckbox(CachedHost, Pad, 0, L"Show perfection on rows", 170,
+                                                        &Config.SpShowInfo, &SaveSettings));
+        TEWLabel* Header = AddHeaderLabel(Parent, ValueBoxWidth, 3, L"min");
+        MoveTo(Header, CardValueX, 26 + TextNudge);
+
+        int16_t Y = 26 + HeaderHeight;
+        for (int i = 0; i < CardFilter::SpStatCount; i++) {
+            const auto Stat = static_cast<CardFilter::SpStat>(i);
+            if (Stat == CardFilter::SpStat::Attack || Stat == CardFilter::SpStat::PvE || Stat == CardFilter::SpStat::FireRes) {
+                Y += GroupGap;
+            }
+            AddLabel(Parent, Pad, static_cast<int16_t>(Y + 4), static_cast<int16_t>(CardValueX - Pad - 4), 1,
+                     CardFilter::SpStatName(Stat));
+            Specialists.Min[i] = WidgetKit::CreateEditBox(CachedHost, CardValueX, Y, ValueBoxWidth, 20);
+            Attach(Parent, Specialists.Min[i].Frame);
+            Y += LineHeight;
+        }
+    }
+
+    void CreatePartnerPanel() {
+        TLBSWidget* Parent = Partners.Container = CreateCardContainer();
+        if (!Parent) return;
+        Attach(Parent, WidgetKit::CreateLabeledCheckbox(CachedHost, Pad, 0, L"Show skill ranks on rows", 170,
+                                                        &Config.PspShowRanks, &SaveSettings));
+    }
+
+    void TickSpecialistPanel() {
+        for (int i = 0; i < CardFilter::SpStatCount; i++) {
+            if (Specialists.Min[i].Edit) Specialists.Rules.Min[i] = ParseNumber(Specialists.Min[i].Edit->GetText());
+        }
+    }
+
+    void __cdecl OnCloseButton(void*) {
+        Config.Enabled = false;
+    }
+
     void CreateFilterWindow(TLBSWidget* Root) {
-        const WidgetKit::WindowDesc Desc{WidgetKit::WindowStyle::Plain, 0, 0, PanelWidth, 400, L"Shell Filter", false};
+        const WidgetKit::WindowDesc Desc{WidgetKit::WindowStyle::Plain, 0, 0, PanelWidth, 400, L"Shell Filter", true};
         Window = WidgetKit::CreateGameWindow(CachedHost, Desc);
         if (!Window) return;
         Window->isMoveable = false;
         Window->isVisible = false;
+        TitleLabel = Window->childrenList && Window->childrenList->count > 0
+                         ? reinterpret_cast<TEWLabel*>(Window->childrenList->list[0])
+                         : nullptr;
+        ShownView = View::None;
+        if (Window->childrenList && Window->childrenList->count > 1) {
+            WidgetKit::SetOnClick(reinterpret_cast<TEWGraphicButtonWidget*>(Window->childrenList->list[1]), &OnCloseButton, nullptr);
+        }
 
         Attach(Window, WidgetKit::CreateLabeledCheckbox(CachedHost, Pad, OptionsTop, L"Tint matches", 80,
                                                         &Config.TintMatches, &SaveSettings));
@@ -486,29 +599,50 @@ namespace {
         Attach(Window, WidgetKit::CreateLabeledCheckbox(CachedHost, Pad, OptionsTop + 22, L"Hide buy on others", 140,
                                                         &Config.HideOtherBuys, &SaveSettings));
 
-        MatchCountLabel = AddLabel(Window, PanelWidth - 12 - 110, 15, 110, 2, L"");
+        MatchCountLabel = AddLabel(Window, PanelWidth - 34 - 110, 15, 110, 2, L"");
         if (MatchCountLabel) MatchCountLabel->textColor = HeaderColor;
         ShownMatchCount.clear();
 
         CreateCategoryPanel(Panels[0], Group::Weapon);
         CreateCategoryPanel(Panels[1], Group::Armor);
         CreateCategoryPanel(Panels[2], Group::Fairy);
+        CreateSpecialistPanel();
+        CreatePartnerPanel();
 
         Unavailable = Widget::Create<TLBSWidget>(CachedHost);
         if (Unavailable) {
             Unavailable->isVisible = false;
             Attach(Window, Unavailable);
             AddLabel(Unavailable, Pad, 4, PanelWidth - 2 * Pad, 1, L"No filter for this category yet.");
-            AddLabel(Unavailable, Pad, 24, PanelWidth - 2 * Pad, 1, L"Pick Weapon or Armour.");
+            AddLabel(Unavailable, Pad, 24, PanelWidth - 2 * Pad, 1, L"Pick Weapon, Armour, Specialist");
+            AddLabel(Unavailable, Pad, 44, PanelWidth - 2 * Pad, 1, L"or Partner.");
         }
         Attach(Root, Window);
     }
 
-    CategoryPanel* PanelForCategory(const uint16_t Category) {
+    View ViewForCategory(const uint16_t Category) {
         switch (Category) {
-            case CategoryWeapon:    return &Panels[0];
-            case CategoryArmour:    return &Panels[1];
-            default:                return nullptr;
+            case CategoryWeapon:        return View::Weapon;
+            case CategoryArmour:        return View::Armour;
+            case CategorySpecialist:    return View::Specialist;
+            case CategoryPartner:       return View::Partner;
+            default:                    return View::None;
+        }
+    }
+
+    CategoryPanel* ShellPanelFor(const View Current) {
+        switch (Current) {
+            case View::Weapon:  return &Panels[0];
+            case View::Armour:  return &Panels[1];
+            default:            return nullptr;
+        }
+    }
+
+    const wchar_t* TitleFor(const View Current) {
+        switch (Current) {
+            case View::Specialist:  return L"SP Filter";
+            case View::Partner:     return L"Partner Filter";
+            default:                return L"Shell Filter";
         }
     }
 
@@ -532,7 +666,8 @@ namespace {
         Window->rect.right = static_cast<int16_t>(X + PanelWidth);
         Window->rect.top = Area.top;
         SetPanelHeight(Window, Height);
-        for (TLBSWidget* Container : {Panels[0].Container, Panels[1].Container, Panels[2].Container, Unavailable}) {
+        for (TLBSWidget* Container : {Panels[0].Container, Panels[1].Container, Panels[2].Container,
+                                      Specialists.Container, Partners.Container, Unavailable}) {
             Place(Container, 0, ContentTop, PanelWidth, static_cast<int16_t>(Height - ContentTop));
         }
     }
@@ -601,9 +736,13 @@ namespace {
         MatchCountLabel->SetText(Text.c_str());
     }
 
-    void ApplyRowLooks(const CategoryPanel* Active) {
-        const bool Filtering = Active && ShellFilter::IsActive(Active->Rules);
-        const int First = (std::max<int>(1, Bazaar->currentPage) - 1) % PagesPerSearch * ResultsPerPage;
+    int FirstListingOnPage() {
+        return (std::max<int>(1, Bazaar->currentPage) - 1) % PagesPerSearch * ResultsPerPage;
+    }
+
+    template <typename MatchFn>
+    void ApplyRowLooks(const bool Filtering, MatchFn&& IsMatch) {
+        const int First = FirstListingOnPage();
         int Listed = 0;
         int Matched = 0;
         for (int i = 0; i < ResultsPerPage; i++) {
@@ -619,12 +758,7 @@ namespace {
                 continue;
             }
             Listed++;
-            bool Match = false;
-            Group Kind;
-            const std::vector<Packet::RCBListShellOption>* Options = nullptr;
-            if (ShellFilter::ShellOptionsOf(Listings[Index], Kind, Options) && Kind == Active->Kind) {
-                Match = ShellFilter::Matches(Active->Rules, *Options);
-            }
+            const bool Match = IsMatch(Listings[Index]);
             if (Match) SetRowLook(i, Config.TintMatches ? RowLook::Tinted : RowLook::Plain);
             else SetRowLook(i, Config.DimOthers ? RowLook::Dimmed : RowLook::Plain);
             SetBuyHidden(i, !Match && Config.HideOtherBuys);
@@ -635,14 +769,262 @@ namespace {
                           : std::wstring{});
     }
 
-    void RefreshFilterButtonLook() {
-        if (FilterButton) FilterButton->color = Config.Enabled ? Color(255, 255, 255, 255) : Color(255, 110, 110, 110);
+    void ApplyRowLooks(const View Current) {
+        if (const CategoryPanel* Shell = ShellPanelFor(Current)) {
+            ApplyRowLooks(ShellFilter::IsActive(Shell->Rules), [&](const Packet::RCBListEntry& Entry) {
+                Group Kind;
+                const std::vector<Packet::RCBListShellOption>* Options = nullptr;
+                return ShellFilter::ShellOptionsOf(Entry, Kind, Options) && Kind == Shell->Kind
+                    && ShellFilter::Matches(Shell->Rules, *Options);
+            });
+        } else if (Current == View::Specialist) {
+            ApplyRowLooks(CardFilter::IsActive(Specialists.Rules), [](const Packet::RCBListEntry& Entry) {
+                const auto* Sp = std::get_if<Packet::RCBListSPInfo>(&Entry.itemInfo);
+                return Sp && CardFilter::Matches(Specialists.Rules, *Sp);
+            });
+        } else {
+            ApplyRowLooks(false, [](const Packet::RCBListEntry&) { return false; });
+        }
+    }
+
+    Color PerfColor(const int Value) {
+        if (Value >= 45) return Color(255, 255, 215, 80);
+        if (Value >= 40) return Color(255, 220, 100, 255);
+        if (Value >= 35) return Color(255, 60, 150, 230);
+        if (Value >= 30) return Color(255, 100, 170, 80);
+        return Color(255, 160, 160, 157);
+    }
+
+    Color PvColor(const int Value) {
+        if (Value >= 80) return Color(255, 255, 215, 80);
+        if (Value >= 75) return Color(255, 220, 100, 255);
+        if (Value >= 70) return Color(255, 60, 150, 230);
+        if (Value >= 65) return Color(255, 100, 170, 80);
+        return Color(255, 160, 160, 157);
+    }
+
+    void SetLabel(TEWLabel* Label, const std::wstring& Text, const Color& TextColor) {
+        if (!Label) return;
+        Label->SetText(Text.c_str());
+        Label->textColor = TextColor;
+    }
+
+    TNTIconWidget* AddIcon(TLBSWidget* Parent, const int16_t X, const int16_t Y, const int16_t ImageId) {
+        TNTIconWidget* Icon = Widget::Create<TNTIconWidget>(CachedHost);
+        if (!Icon) return nullptr;
+        // same values the game sets in its icon constructor 0x741710
+        auto* Raw = reinterpret_cast<uint8_t*>(Icon);
+        Icon->keepTransparency = false;
+        Icon->resized = true;
+        *reinterpret_cast<float*>(Raw + 0x90) = 1.0f;
+        Raw[0xAB] = 1;
+        Raw[0xAC] = 1;
+        Raw[0xAE] = 10;
+        Raw[0xD2] = 1;
+        Raw[0xD3] = 1;
+        Icon->isInteractable = false;
+        Icon->image->imageID = ImageId;
+        Icon->image->type = 3;
+        Place(Icon, X, Y, 15, 15);
+        Attach(Parent, Icon);
+        return Icon;
+    }
+
+    TLBSWidget* AddRowGroup(TLBSWidget* BuyTab, const int16_t X, const int16_t Y, const int16_t Width) {
+        TLBSWidget* RowGroup = Widget::Create<TLBSWidget>(CachedHost);
+        if (!RowGroup) return nullptr;
+        RowGroup->isVisible = false;
+        RowGroup->isInteractable = false;
+        Place(RowGroup, X, Y, Width, 40);
+        Attach(BuyTab, RowGroup);
+        return RowGroup;
+    }
+
+    TEWLabel* AddRowLabel(TLBSWidget* Parent, const int16_t X, const int16_t TextY, const int16_t Width,
+                          const uint8_t Font = 1) {
+        TEWLabel* Label = AddLabel(Parent, X, TextY, Width, 1, L"");
+        if (Label) Label->fontStyle = Font;
+        return Label;
+    }
+
+    int32_t ResultColumnsEnd(const TLBSWidget* BuyTab) {
+        int32_t Last = -1;
+        for (const TEWStringListViewCore* Column : {Bazaar->itemNameColumn, Bazaar->amountColumn, Bazaar->pricePerUnitColumn,
+                                                    Bazaar->timePeriodColumn, Bazaar->sellerColumn}) {
+            Last = std::max(Last, BuyTab->childrenList->index_of(reinterpret_cast<TLBSWidget*>(const_cast<TEWStringListViewCore*>(Column))));
+        }
+        return Last;
+    }
+
+    void CreateCardRows() {
+        TLBSWidget* BuyTab = Bazaar->buyTab;
+        if (!BuyTab || !BuyTab->childrenList) return;
+        const uint32_t FirstCreated = BuyTab->childrenList->count;
+        for (int i = 0; i < ResultsPerPage; i++) {
+            const TNTIconWidget* ItemIcon = Bazaar->GetIconWidget(i);
+            if (!ItemIcon) continue;
+            const Rect& Area = ItemIcon->rect;
+
+            SpRowInfo& Sp = SpRows[i];
+            Sp.Group = AddRowGroup(BuyTab, 63, static_cast<int16_t>(Area.top + 4), 237);
+            if (Sp.Group) {
+                for (int s = 0; s < 4; s++) {
+                    const auto X = static_cast<int16_t>(s % 2 * 44);
+                    const auto Y = static_cast<int16_t>(s / 2 * 20);
+                    AddIcon(Sp.Group, X, Y, static_cast<int16_t>(7000 + s));
+                    Sp.Perf[s] = AddRowLabel(Sp.Group, static_cast<int16_t>(X + 17), Y, 26);
+                }
+                if (TEWLabel* Label = AddLabel(Sp.Group, 92, 0, 28, 1, L"PvE")) Label->textColor = HeaderColor;
+                if (TEWLabel* Label = AddLabel(Sp.Group, 92, 20, 28, 1, L"PvP")) Label->textColor = HeaderColor;
+                Sp.PvE = AddRowLabel(Sp.Group, 120, 0, 30);
+                Sp.PvP = AddRowLabel(Sp.Group, 120, 20, 30);
+                Sp.Upgrade = AddRowLabel(Sp.Group, 160, 10, 40, 3);
+            }
+
+            PspRowInfo& Psp = PspRows[i];
+            Psp.Group = AddRowGroup(BuyTab, 205, static_cast<int16_t>(Area.top + 4), 95);
+            if (Psp.Group) {
+                for (int s = 0; s < 3; s++) Psp.Ranks[s] = AddRowLabel(Psp.Group, static_cast<int16_t>(s * 16), 10, 16, 3);
+                Psp.Upgrade = AddRowLabel(Psp.Group, 54, 10, 40, 3);
+            }
+            Psp.Badge = AddIcon(BuyTab, static_cast<int16_t>(Area.right - 17), static_cast<int16_t>(Area.top + 2), 0);
+            Show(Psp.Badge, false);
+        }
+
+        int32_t Next = ResultColumnsEnd(BuyTab) + 1;
+        if (Next > 0 && static_cast<uint32_t>(Next) < FirstCreated) {
+            std::vector<TLBSWidget*> Created(BuyTab->childrenList->list + FirstCreated,
+                                             BuyTab->childrenList->list + BuyTab->childrenList->count);
+            for (TLBSWidget* Widget : Created) BuyTab->childrenList->move_to_index(Widget, static_cast<uint32_t>(Next++));
+        }
+        std::fill(std::begin(RenderedVersion), std::end(RenderedVersion), 0);
+    }
+
+    void RenderSpRow(const SpRowInfo& Row, const Packet::RCBListSPInfo& Sp) {
+        const int Perf[4] = {Sp.attackPerf, Sp.defencePerf, Sp.elementPerf, Sp.hpmpPerf};
+        for (int s = 0; s < 4; s++) SetLabel(Row.Perf[s], std::to_wstring(Perf[s]), PerfColor(Perf[s]));
+        const int PvE = CardFilter::SpStatValue(Sp, CardFilter::SpStat::PvE);
+        const int PvP = CardFilter::SpStatValue(Sp, CardFilter::SpStat::PvP);
+        SetLabel(Row.PvE, std::to_wstring(PvE), PvColor(PvE));
+        SetLabel(Row.PvP, std::to_wstring(PvP), PvColor(PvP));
+        SetLabel(Row.Upgrade, L"+" + std::to_wstring(Sp.upgradingGrade), PlainColor);
+    }
+
+    const wchar_t* RankLetter(const int Rank) {
+        static const wchar_t* const Letters[] = {L"-", L"F", L"E", L"D", L"C", L"B", L"A", L"S"};
+        return Rank >= 0 && Rank <= CardFilter::MaxRank ? Letters[Rank] : L"?";
+    }
+
+    Color RankColor(const int Rank) {
+        if (Rank >= 7) return Color(255, 255, 215, 80);
+        if (Rank >= 6) return Color(255, 220, 100, 255);
+        if (Rank >= 5) return Color(255, 60, 150, 230);
+        if (Rank >= 4) return Color(255, 100, 170, 80);
+        return Color(255, 160, 160, 157);
+    }
+
+    int16_t RankIcon(const int Rank) {
+        return static_cast<int16_t>(31209 + Rank);
+    }
+
+    int AverageRank(const Packet::RCBListPSPInfo& Psp) {
+        return (Psp.skill1tier + Psp.skill2tier + Psp.skill3tier) / 3;
+    }
+
+    void RenderPspRow(const PspRowInfo& Row, const Packet::RCBListPSPInfo& Psp) {
+        for (int s = 0; s < 3; s++) {
+            const int Rank = std::clamp(CardFilter::SkillRank(Psp, s), 0, CardFilter::MaxRank);
+            SetLabel(Row.Ranks[s], RankLetter(Rank), RankColor(Rank));
+        }
+        SetLabel(Row.Upgrade, L"+" + std::to_wstring(Psp.upgradeLevel), PlainColor);
+        const int Average = AverageRank(Psp);
+        if (Row.Badge && Average > 0) Row.Badge->image->imageID = RankIcon(std::min(Average, CardFilter::MaxRank));
+    }
+
+    void SetColumnHidden(TLBSWidget* Column, bool& HiddenByUs, const bool Hide) {
+        if (!Column) return;
+        if (Hide) {
+            if (!Column->isVisible) return;
+            Column->isVisible = false;
+            HiddenByUs = true;
+        } else if (HiddenByUs) {
+            Column->isVisible = true;
+            HiddenByUs = false;
+        }
+    }
+
+    void SetCardIcon(const int Slot, const int Vnum) {
+        TNTIconWidget* Icon = Bazaar->GetIconWidget(Slot);
+        if (!Icon || !Icon->image) return;
+        if (Vnum < 0) {
+            if (IconReplacedByUs[Slot] && Icon->image->imageID != OriginalIcon[Slot]) Icon->image->imageID = OriginalIcon[Slot];
+            IconReplacedByUs[Slot] = false;
+            return;
+        }
+        const auto& Icons = ItemIcons::ByVnum();
+        const auto Found = Icons.find(Vnum);
+        if (Found == Icons.end()) return;
+        const auto Wanted = static_cast<int16_t>(Found->second);
+        if (Icon->image->imageID == Wanted) return;
+        OriginalIcon[Slot] = Icon->image->imageID;
+        IconReplacedByUs[Slot] = true;
+        Icon->image->imageID = Wanted;
+    }
+
+    void HideCardRows() {
+        for (int i = 0; i < ResultsPerPage; i++) {
+            if (Bazaar) SetCardIcon(i, -1);
+            Show(SpRows[i].Group, false);
+            Show(PspRows[i].Group, false);
+            Show(PspRows[i].Badge, false);
+        }
+        if (!Bazaar) return;
+        SetColumnHidden(reinterpret_cast<TLBSWidget*>(Bazaar->itemNameColumn), NameColumnHiddenByUs, false);
+        SetColumnHidden(reinterpret_cast<TLBSWidget*>(Bazaar->amountColumn), AmountColumnHiddenByUs, false);
+    }
+
+    void TrackSearches() {
+        const bool Loading = Bazaar->isLoading;
+        if (Loading && !WasLoading) {
+            Listings.clear();
+            ListingsVersion++;
+        }
+        WasLoading = Loading;
+    }
+
+    void UpdateCardRows() {
+        const bool NoResults = Bazaar->noItemFoundText && Bazaar->noItemFoundText->isVisible;
+        if (Bazaar->isLoading || NoResults || (!Config.SpShowInfo && !Config.PspShowRanks)) {
+            HideCardRows();
+            return;
+        }
+        const int First = FirstListingOnPage();
+        bool AnySp = false;
+        bool AnyPsp = false;
+        for (int i = 0; i < ResultsPerPage; i++) {
+            const int Index = First + i;
+            const Packet::RCBListEntry* Entry = Index < static_cast<int>(Listings.size()) ? &Listings[Index] : nullptr;
+            const auto* Sp = Config.SpShowInfo && Entry ? std::get_if<Packet::RCBListSPInfo>(&Entry->itemInfo) : nullptr;
+            const auto* Psp = Config.PspShowRanks && Entry ? std::get_if<Packet::RCBListPSPInfo>(&Entry->itemInfo) : nullptr;
+            if ((Sp || Psp) && (RenderedVersion[i] != ListingsVersion || RenderedIndex[i] != Index)) {
+                if (Sp) RenderSpRow(SpRows[i], *Sp);
+                if (Psp) RenderPspRow(PspRows[i], *Psp);
+                RenderedVersion[i] = ListingsVersion;
+                RenderedIndex[i] = Index;
+            }
+            SetCardIcon(i, Sp ? Sp->SPID : Psp ? Psp->PSPID : -1);
+            Show(SpRows[i].Group, Sp != nullptr);
+            Show(PspRows[i].Group, Psp != nullptr);
+            Show(PspRows[i].Badge, Psp && AverageRank(*Psp) > 0);
+            AnySp |= Sp != nullptr;
+            AnyPsp |= Psp != nullptr;
+        }
+        SetColumnHidden(reinterpret_cast<TLBSWidget*>(Bazaar->itemNameColumn), NameColumnHiddenByUs, AnySp);
+        SetColumnHidden(reinterpret_cast<TLBSWidget*>(Bazaar->amountColumn), AmountColumnHiddenByUs, AnySp || AnyPsp);
     }
 
     void ToggleFilter() {
         Config.Enabled = !Config.Enabled;
-        SaveSettings(nullptr);
-        RefreshFilterButtonLook();
     }
 
     void __cdecl OnFilterButton(void*) {
@@ -683,11 +1065,11 @@ namespace {
             Caption->shadowColor = Color(255, 1, 61, 255);
         }
         Attach(BuyTab, FilterButton);
-        RefreshFilterButtonLook();
     }
 
     bool OnSearchResults(const Packet::RCBListPacket& Packet) {
         Listings = Packet.entries;
+        ListingsVersion++;
         return true;
     }
 
@@ -714,11 +1096,20 @@ extern "C" {
         ImGui::SetAllocatorFunctions(AllocFunc, FreeFunc, AllocUserData);
         CachedHost = Host;
         LoadSettings();
+        ItemIcons::ByVnum();
         Packet::SubscribePacket(Host, &OnSearchResults);
     }
 
     __declspec(dllexport) void ModShutdown() {
         ClearRowLooks();
+        HideCardRows();
+        for (int i = 0; i < ResultsPerPage; i++) {
+            Detach(SpRows[i].Group);
+            Detach(PspRows[i].Group);
+            Detach(PspRows[i].Badge);
+            SpRows[i] = {};
+            PspRows[i] = {};
+        }
         Detach(FilterButton);
         FilterButton = nullptr;
         Detach(Window);
@@ -742,11 +1133,21 @@ extern "C" {
             FilterButton = nullptr;
             std::fill(std::begin(RowLooks), std::end(RowLooks), RowLook::Plain);
             std::fill(std::begin(BuyHiddenByUs), std::end(BuyHiddenByUs), false);
+            std::fill(std::begin(SpRows), std::end(SpRows), SpRowInfo{});
+            std::fill(std::begin(PspRows), std::end(PspRows), PspRowInfo{});
+            NameColumnHiddenByUs = false;
+            AmountColumnHiddenByUs = false;
+            WasLoading = false;
+            std::fill(std::begin(IconReplacedByUs), std::end(IconReplacedByUs), false);
             AttachedRoot = Root;
             CreateFilterWindow(Root);
         }
         if (!Bazaar) Bazaar = FindBazaar(Root);
-        if (Bazaar && !FilterButton) CreateFilterButton();
+        if (Bazaar && !FilterButton) {
+            CreateFilterButton();
+            CreateCardRows();
+        }
+        if (Bazaar) TrackSearches();
 
         if (!Window || !Bazaar) {
             CachedHost->ReportStatus(ModHealthLevel::Broken, !Window ? "Couldn't create the filter window."
@@ -764,19 +1165,30 @@ extern "C" {
         Show(Window, Shown);
         if (!Shown) {
             ClearRowLooks();
+            HideCardRows();
             return;
         }
         FollowBazaar();
 
-        CategoryPanel* Active = PanelForCategory(Bazaar->categoryFilter);
+        const View Current = ViewForCategory(Bazaar->categoryFilter);
+        if (Current != ShownView) {
+            if (TitleLabel) TitleLabel->SetText(TitleFor(Current));
+            ShownView = Current;
+        }
+        CategoryPanel* Active = ShellPanelFor(Current);
         for (CategoryPanel& Panel : Panels) Show(Panel.Container, &Panel == Active);
-        Show(Unavailable, Active == nullptr);
+        Show(Specialists.Container, Current == View::Specialist);
+        Show(Partners.Container, Current == View::Partner);
+        Show(Unavailable, Current == View::None);
 
         if (Active) {
             TickPanel(*Active, tickContext);
+        } else if (Current == View::Specialist) {
+            TickSpecialistPanel();
         }
         RefreshTint();
-        ApplyRowLooks(Active);
+        ApplyRowLooks(Current);
+        UpdateCardRows();
     }
 
     __declspec(dllexport) void ModTick(const TLBSWidget*, TickContext) {}

@@ -22,6 +22,8 @@ FetchContent_MakeAvailable(imgui)
 
 add_library(BazaarFilter SHARED
         BazaarFilter/BazaarFilter.cpp
+        BazaarFilter/CardFilter.cpp
+        BazaarFilter/ItemIcons.cpp
         BazaarFilter/ShellAttributes.cpp
         BazaarFilter/ShellFilter.cpp
         WidgetKit/WidgetKit.cpp
